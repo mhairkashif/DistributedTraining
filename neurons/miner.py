@@ -38,6 +38,7 @@ from huggingface_hub import (
     delete_tag,
     list_repo_refs,
     repo_exists,
+    HfApi
 )
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
@@ -223,19 +224,29 @@ class Miner(BaseMinerNeuron):
         """Get GPU utilization percentage"""
         try:
             if self.device.startswith("cuda"):
-                result = (
-                    subprocess.check_output(
-                        [
-                            "nvidia-smi",
-                            "--query-gpu=utilization.gpu",
-                            "--format=csv,noheader,nounits",
-                        ]
+                # Use pynvml if available for lower overhead, fallback to subprocess
+                try:
+                    import pynvml
+                    pynvml.nvmlInit()
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(self.config.neuron.cuda_device) # Assuming self.config.neuron.cuda_device is configured
+                    utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    return float(utilization.gpu)
+                except ImportError:
+                    # Fallback to subprocess if pynvml is not installed
+                    result = (
+                        subprocess.check_output(
+                            [
+                                "nvidia-smi",
+                                "--query-gpu=utilization.gpu",
+                                "--format=csv,noheader,nounits",
+                            ]
+                        )
+                        .decode("utf-8")
+                        .strip()
                     )
-                    .decode("utf-8")
-                    .strip()
-                )
-                return float(result)
-        except:
+                    return float(result)
+        except Exception as e:
+            bt.logging.warning(f"Could not get GPU utilization: {e}")
             pass
         return 0.0
 
@@ -244,6 +255,8 @@ class Miner(BaseMinerNeuron):
         # Implement based on your system's network monitoring
         try:
             # This is a placeholder - implement actual bandwidth measurement
+            # Consider using psutil.net_io_counters() for more accurate
+            # bandwidth measurement by tracking bytes_sent and bytes_recv over time.
             return random.uniform(20, 30)  # MB/s
         except:
             return 0.0
@@ -293,11 +306,17 @@ class Miner(BaseMinerNeuron):
 
         # Save directory
         self.output_dir = self.config.neuron.local_model_name.split("/")[-1]
+        os.makedirs(self.output_dir, exist_ok=True) # Ensure output directory exists early
 
         # Create Tag Deletion Queue & Thread
         self.tag_deletion_queue = Queue()
         self.tag_deletion_thread = threading.Thread(target=self.delete_tags)
+        self.tag_deletion_thread.daemon = True # Make it a daemon thread
         self.tag_deletion_thread.start()
+
+        # Hugging Face API client
+        self.hf_api = HfApi()
+
 
     def delete_tags(self):
         while True:
@@ -307,12 +326,12 @@ class Miner(BaseMinerNeuron):
                 tag_name = self.tag_deletion_queue.get()
                 try:
                     # Update tag for this version
-                    delete_tag(
-                        self.config.neuron.local_model_name,
+                    self.hf_api.delete_tag(
+                        repo_id=self.config.neuron.local_model_name,
                         repo_type="model",
                         tag=tag_name,
                     )
-                    bt.logging.info(f"Succesfully deleted tag {tag_name}")
+                    bt.logging.info(f"Successfully deleted tag {tag_name}")
                 except Exception as e:
                     bt.logging.info(f"Failed to delete tag {tag_name} with error {e}")
                 time.sleep(30)
@@ -335,7 +354,7 @@ class Miner(BaseMinerNeuron):
         self.learning_rate_maximum = 4e-4
         self.weight_decay = 0.1
         self.num_inner_steps = 500
-        self.offload_optimizer = True
+        self.offload_optimizer = True # Keep this if desired, otherwise set to False
 
         # Upload settings
         self.model_upload_retry_limit = 3
@@ -349,6 +368,8 @@ class Miner(BaseMinerNeuron):
         load_model_optimizer_gradient_averager(
             self, self.config.neuron.local_model_name, self.local_progress.epoch
         )
+        # Ensure model is on the correct device after loading
+        self.model.to(self.device)
         self.model.config.block_list = []
         cleanup_old_cache(self, repo_id=self.config.neuron.local_model_name)
 
@@ -357,7 +378,7 @@ class Miner(BaseMinerNeuron):
             max_workers=1, thread_name_prefix="model_upload"
         )
         self.current_upload_future = None
-        self.upload_process = None
+        # self.upload_process = None # No longer needed with hf_api.upload_folder
 
         # Sync and initialize handlers
         self._sync_with_global_model()
@@ -383,18 +404,34 @@ class Miner(BaseMinerNeuron):
         log_peerid_to_chain(self)
 
     def _sync_with_global_model(self):
-        global_model = AutoModelForCausalLM.from_pretrained(
-            self.config.neuron.global_model_name,
-            revision=f"{__run__}.{self.global_progress.epoch}.0",
-            trust_remote_code=False,
-        )
+        # Load global model directly to the device if possible and sufficient VRAM
+        try:
+            global_model = AutoModelForCausalLM.from_pretrained(
+                self.config.neuron.global_model_name,
+                revision=f"{__run__}.{self.global_progress.epoch}.0",
+                trust_remote_code=False,
+            ).to(self.device)
+            bt.logging.info("Global model loaded directly to device for schema comparison.")
+        except RuntimeError as e:
+            bt.logging.warning(f"Could not load global model directly to device: {e}. Loading to CPU.")
+            global_model = AutoModelForCausalLM.from_pretrained(
+                self.config.neuron.global_model_name,
+                revision=f"{__run__}.{self.global_progress.epoch}.0",
+                trust_remote_code=False,
+            )
 
         if self.config.neuron.global_model_name == self.config.neuron.local_model_name:
             bt.logging.warning(
                 "Your local miner_hf_repo_id set to the global model_name. This will harm your incentive. Set miner_hf_repo_id to a unique huggingface repo id."
             )
 
-        self.model.to("cpu")
+        # Move current model to CPU only for comparison if not already there
+        # This is to free up GPU memory temporarily if global model was loaded to GPU
+        # and current model is also on GPU.
+        if self.model.device != torch.device("cpu"):
+            self.model.to("cpu")
+            torch.cuda.empty_cache() # Clear GPU cache after moving model
+
         should_sync_model = (
             (self.local_progress.epoch is None)
             or (self.local_progress.epoch != self.global_progress.epoch)
@@ -403,25 +440,29 @@ class Miner(BaseMinerNeuron):
                 != compute_schema_hash(self.model.parameters())
             )
         )
+        
+        # Move local model back to the device immediately after comparison
         self.model.to(self.device)
+        
+        del global_model # Delete global model as soon as it's not needed
+        gc.collect()
+        torch.cuda.empty_cache()
+
         if should_sync_model:
-            del global_model
-            gc.collect()
-            torch.cuda.empty_cache()
             load_state_from_peer(self, epoch=self.global_progress.epoch)
             self.start_background_upload(
                 epoch=self.global_progress.epoch,
             )
-        else:
-            del global_model
-            gc.collect()
-            torch.cuda.empty_cache()
+
 
     def upload_model(self, epoch):
         """Unified function to save and upload both model and optimizer state"""
-        if not repo_exists(self.config.neuron.local_model_name, repo_type="model"):
+        # Using HfApi client for direct upload
+        hf_api = self.hf_api
+
+        if not hf_api.repo_exists(self.config.neuron.local_model_name, repo_type="model"):
             try:
-                create_repo(
+                hf_api.create_repo(
                     self.config.neuron.local_model_name,
                     repo_type="model",
                     private=False,
@@ -440,13 +481,23 @@ class Miner(BaseMinerNeuron):
                 bt.logging.info("Upload Cancelled Due To AllReduce Operation")
                 return False
             try:
-                if not os.path.exists(self.output_dir):
-                    os.makedirs(self.output_dir)
                 bt.logging.info(
                     f":memory: Saving model state locally for epoch {epoch}"
                 )
                 self.model.config.inner_step = self.local_progress.inner_step
+                
+                # Move model to CPU only for saving if offload_optimizer is True
+                # This ensures the model state is on CPU for saving, potentially saving VRAM during this brief period
+                if self.offload_optimizer:
+                    self.model.to("cpu")
+                    torch.cuda.empty_cache() # Clear GPU cache immediately
+
                 self.model.save_pretrained(os.path.join(self.output_dir))
+
+                # Move model back to device if it was moved to CPU for saving
+                if self.offload_optimizer:
+                    self.model.to(self.device)
+                    torch.cuda.empty_cache() # Clear GPU cache immediately
 
                 # Reset model blocklist & keep local copy in case upload fails
                 block_list = self.model.config.block_list
@@ -471,59 +522,47 @@ class Miner(BaseMinerNeuron):
                     f":upload: Uploading model and optimizer states to repo: {self.config.neuron.local_model_name}"
                 )
                 commit_message = f"Run {__run__}. Outer Step {epoch}. Inner Step {self.local_progress.inner_step}."
-                self.upload_process = subprocess.Popen(
-                    [
-                        "python",
-                        os.path.abspath(__file__).replace(
-                            "neurons/miner.py",
-                            "distributed_training/utils/upload_worker.py",
-                        ),
-                        self.config.neuron.local_model_name,
-                        self.output_dir,
-                        commit_message,
-                    ]
+                
+                # Use hf_api.upload_folder for atomic and potentially faster upload
+                hf_api.upload_folder(
+                    folder_path=self.output_dir,
+                    repo_id=self.config.neuron.local_model_name,
+                    repo_type="model",
+                    commit_message=commit_message,
+                    # Add create_pr=True if you want to use PRs for better review, but it adds an extra step
+                    # git_add=True, # Default is True, ensures all files in folder are added
+                    # git_commit=True, # Default is True
+                    # git_push=True, # Default is True
                 )
-                while self.upload_process.poll() is None:
-                    if not self.training_active.is_set():
-                        self.upload_process.kill()
-                        bt.logging.info(
-                            "Cancelling Ongoing Model Upload For AllReduce Operation"
-                        )
-                        self.model.config.block_list = (
-                            block_list + self.model.config.block_list
-                        )
-                        return False
-                    else:
-                        time.sleep(5)
 
-                refs = list_repo_refs(
-                    self.config.neuron.local_model_name, repo_type="model"
+                # Tag management using HfApi
+                refs = hf_api.list_repo_refs(
+                    repo_id=self.config.neuron.local_model_name, repo_type="model"
                 )
                 for tag in refs.tags:
                     if (tag.name == "None") or (
                         tag.name == f"{__run__}.{epoch}.{self.model.config.inner_step}"
                     ):
-                        # Update tag for this version
-                        delete_tag(
-                            self.config.neuron.local_model_name,
+                        hf_api.delete_tag(
+                            repo_id=self.config.neuron.local_model_name,
                             repo_type="model",
                             tag=tag.name,
                         )
-                        time.sleep(30)
+                        time.sleep(1) # Small delay to ensure tag deletion propagates
                     elif (
                         (len(tag.name.split(".")) == 3)
                         and (tag.name.split(".")[0] == __run__)
                         and (int(tag.name.split(".")[1]) > epoch)
                     ):
                         self.tag_deletion_queue.put(tag.name)
-                # Create new tag for this version
-                create_tag(
-                    self.config.neuron.local_model_name,
+                
+                hf_api.create_tag(
+                    repo_id=self.config.neuron.local_model_name,
                     repo_type="model",
                     tag=f"{__run__}.{epoch}.{self.model.config.inner_step}",
                     tag_message=commit_message,
                 )
-                # Cleanup old cache
+                
                 cleanup_old_cache(
                     self,
                     repo_id=self.config.neuron.local_model_name,
@@ -607,7 +646,10 @@ class Miner(BaseMinerNeuron):
     def pause_training(self):
         """Pauses the continuous training loop"""
         self.training_active.clear()
-        time.sleep(1)
+        # Wait for the training worker to acknowledge the pause
+        # A small delay here can help ensure the training loop is actually paused
+        # before any further operations, but avoid long blocking.
+        time.sleep(0.1) 
         self.training_status = TrainingStatus.PAUSED
         bt.logging.info(":warning:  Pausing continuous training.")
 
@@ -663,6 +705,8 @@ class Miner(BaseMinerNeuron):
                 self.training_active.wait()
 
                 # Periodic model upload
+                # Check for block list length *after* a potential pause and resume,
+                # so training can continue for a bit before triggering another upload.
                 if (
                     len(self.model.config.block_list)
                     >= self.config.neuron.target_n_blocks
@@ -676,7 +720,7 @@ class Miner(BaseMinerNeuron):
                     self.fetch_training_data()
                 )
 
-                # Wait if training is paused
+                # Wait if training is paused (again, in case something happened during data fetch)
                 self.training_active.wait()
 
                 self.model.config.block_list.append(self.current_block)
@@ -696,8 +740,9 @@ class Miner(BaseMinerNeuron):
             if not self.training_active.is_set():
                 break
 
-            # Move to device
-            inputs, labels = inputs.to(self.device), labels.to(self.device)
+            # Move to device - Data already on device if using DatasetLoader with device argument
+            # Ensure tensors are contiguous if performing operations that benefit from it
+            inputs, labels = inputs.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 outputs = self.model(input_ids=inputs, labels=labels)
@@ -738,12 +783,13 @@ class Miner(BaseMinerNeuron):
                 self.inner_optimizer_step()
 
     def inner_optimizer_step(self):
+        # Clip gradients after accumulation and before step
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.inner_optimizer.step()
 
         self.scheduler.step()
 
-        self.inner_optimizer.zero_grad()
+        self.inner_optimizer.zero_grad(set_to_none=True) # More efficient than zero_grad()
 
         self.local_progress.inner_step += 1
 
@@ -766,11 +812,16 @@ class Miner(BaseMinerNeuron):
                         "Cancelling Ongoing Model Upload For AllReduce Operation"
                     )
                     self.current_upload_future.cancel()
+                    # Await the cancellation if it's critical to ensure it's stopped before proceeding
+                    # try:
+                    #     await self.current_upload_future # This might raise CancelledError
+                    # except asyncio.CancelledError:
+                    #     bt.logging.info("Background upload successfully cancelled.")
 
                 # Ensure training is paused
                 self.pause_training()
 
-                # Run inner optimizer step
+                # Run inner optimizer step - this is done here to ensure latest gradients are applied
                 self.inner_optimizer_step()
 
                 # Update gradient averager params to latest synapse values
@@ -828,6 +879,8 @@ class Miner(BaseMinerNeuron):
                 self.resume_training()
             else:
                 self.all_reduce_success_status = False
+                # If all_reduce failed, ensure training resumes unless specific error handling is needed
+                self.resume_training() # It's generally good to resume training even if all_reduce fails, to not stall the miner
 
             return synapse
 
