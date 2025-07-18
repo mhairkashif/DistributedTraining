@@ -223,12 +223,16 @@ class Miner(BaseMinerNeuron):
     def _get_gpu_utilization(self):
         """Get GPU utilization percentage"""
         try:
-            if self.device.startswith("cuda"):
+            # Convert self.device to string for comparison or check its type
+            if str(self.device).startswith("cuda"):
                 # Use pynvml if available for lower overhead, fallback to subprocess
                 try:
                     import pynvml
                     pynvml.nvmlInit()
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(self.config.neuron.cuda_device) # Assuming self.config.neuron.cuda_device is configured
+                    # Assuming self.config.neuron.cuda_device is configured, or extract device index from self.device
+                    # If self.device is 'cuda:0', you might want to get the '0'
+                    device_index = self.device.index if self.device.type == 'cuda' and self.device.index is not None else 0
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
                     utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
                     return float(utilization.gpu)
                 except ImportError:
