@@ -727,7 +727,7 @@ class Miner(BaseMinerNeuron):
             try:
                 pages = await DatasetLoader.next_pages(
                     offset=self.current_block,
-                    n_pages=35,
+                    n_pages=15, # MODIFIED: Reduced from 35 to 15 to lower RAM consumption per fetch
                     seed=self.uid,
                 )
                 random.seed(self.uid)
@@ -738,9 +738,11 @@ class Miner(BaseMinerNeuron):
                     sequence_length=1024,
                     pages_info=pages,
                     tokenizer=self.tokenizer,
-                    # Removed num_workers as it's not supported by DatasetLoader.create()
-                    pin_memory=True # Pin memory for faster GPU transfers
+                    pin_memory=False # MODIFIED: Changed to False to reduce host RAM usage
                 )
+                # Explicitly clear memory after creating dataset
+                gc.collect()
+                torch.cuda.empty_cache()
 
                 return dataset
             except Exception as e:
@@ -845,6 +847,10 @@ class Miner(BaseMinerNeuron):
 
                 # Run inner optimizer step
                 self.inner_optimizer_step()
+        # Ensure that after processing a full dataset, memory is explicitly cleared
+        gc.collect()
+        torch.cuda.empty_cache()
+
 
     def inner_optimizer_step(self):
         # Clip gradients after accumulation and before step
