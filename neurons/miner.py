@@ -23,6 +23,9 @@ import subprocess
 import time
 import typing
 
+# 1. Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True as early as possible
+# This helps PyTorch manage fragmented memory more effectively.
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 os.environ["NEST_ASYNCIO"] = "0"
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -188,6 +191,7 @@ class Miner(BaseMinerNeuron):
             .field("cpu_percent", psutil.cpu_percent())
             .field("memory_percent", psutil.virtual_memory().percent)
             .field("gpu_utilization", self._get_gpu_utilization())
+            .field("gpu_memory_used_gb", self._get_gpu_memory_used_gb()) # Add GPU memory usage
         )
         points.append(point)
 
@@ -223,16 +227,12 @@ class Miner(BaseMinerNeuron):
     def _get_gpu_utilization(self):
         """Get GPU utilization percentage"""
         try:
-            # Convert self.device to string for comparison or check its type
-            if str(self.device).startswith("cuda"):
+            if self.device.startswith("cuda"):
                 # Use pynvml if available for lower overhead, fallback to subprocess
                 try:
                     import pynvml
                     pynvml.nvmlInit()
-                    # Assuming self.config.neuron.cuda_device is configured, or extract device index from self.device
-                    # If self.device is 'cuda:0', you might want to get the '0'
-                    device_index = self.device.index if self.device.type == 'cuda' and self.device.index is not None else 0
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device()) # Use current_device
                     utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
                     return float(utilization.gpu)
                 except ImportError:
@@ -253,6 +253,37 @@ class Miner(BaseMinerNeuron):
             bt.logging.warning(f"Could not get GPU utilization: {e}")
             pass
         return 0.0
+
+    def _get_gpu_memory_used_gb(self):
+        """Get GPU memory used in GB"""
+        try:
+            if self.device.startswith("cuda"):
+                # Use pynvml if available
+                try:
+                    import pynvml
+                    pynvml.nvmlInit()
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+                    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    return info.used / (1024**3)  # Convert bytes to GB
+                except ImportError:
+                    # Fallback to subprocess if pynvml is not installed
+                    result = (
+                        subprocess.check_output(
+                            [
+                                "nvidia-smi",
+                                "--query-gpu=memory.used",
+                                "--format=csv,noheader,nounits",
+                            ]
+                        )
+                        .decode("utf-8")
+                        .strip()
+                    )
+                    return float(result) / 1024 # Convert MB to GB
+        except Exception as e:
+            bt.logging.warning(f"Could not get GPU memory usage: {e}")
+            pass
+        return 0.0
+
 
     def _get_network_bandwidth(self):
         """Get network bandwidth usage in MB/s"""
@@ -358,7 +389,10 @@ class Miner(BaseMinerNeuron):
         self.learning_rate_maximum = 4e-4
         self.weight_decay = 0.1
         self.num_inner_steps = 500
-        self.offload_optimizer = True # Keep this if desired, otherwise set to False
+        # Ensure offload_optimizer is True to reduce GPU memory footprint of optimizer state
+        # Keeping offload_optimizer True by default even with 48GB VRAM
+        # as large models can still consume significant optimizer state.
+        self.offload_optimizer = True
 
         # Upload settings
         self.model_upload_retry_limit = 3
@@ -374,6 +408,19 @@ class Miner(BaseMinerNeuron):
         )
         # Ensure model is on the correct device after loading
         self.model.to(self.device)
+
+        # Attempt to compile the model for performance (PyTorch 2.0+)
+        if hasattr(torch, 'compile'):
+            try:
+                # 'max-autotune' can be faster but might use more memory/longer compile times.
+                # 'reduce-overhead' is generally safer for memory.
+                # Given 48GB VRAM, 'max-autotune' might be a viable option to try
+                # but we'll stick with 'reduce-overhead' as a safer default.
+                self.model = torch.compile(self.model, mode='reduce-overhead')
+                bt.logging.info("Model compiled with torch.compile for potential speedup.")
+            except Exception as e:
+                bt.logging.warning(f"Failed to compile model with torch.compile: {e}")
+
         self.model.config.block_list = []
         cleanup_old_cache(self, repo_id=self.config.neuron.local_model_name)
 
@@ -388,7 +435,11 @@ class Miner(BaseMinerNeuron):
         self._sync_with_global_model()
 
     def _setup_training_params(self):
-        self.local_batch_size_train = self.config.neuron.local_batch_size_train
+        # Make sure these are configured appropriately in your main config.py or CLI args
+        # With 48GB VRAM, you can significantly increase local_batch_size_train.
+        # Start with a higher value than before, e.g., 8, 16, or even 32,
+        # and adjust based on actual memory usage.
+        self.local_batch_size_train = self.config.neuron.local_batch_size_train # This should be set in config/CLI
         self.local_batch_size_train_effective = (
             self.config.neuron.local_batch_size_train_effective
         )
@@ -410,6 +461,13 @@ class Miner(BaseMinerNeuron):
     def _sync_with_global_model(self):
         # Load global model directly to the device if possible and sufficient VRAM
         try:
+            # Temporarily move self.model to CPU to free up VRAM for global_model comparison
+            # This is crucial if both models are very large.
+            if self.model.device != torch.device("cpu"):
+                self.model.to("cpu")
+                bt.logging.info("Moved local model to CPU for global model comparison to free VRAM.")
+                torch.cuda.empty_cache() # Clear GPU cache after moving model
+
             global_model = AutoModelForCausalLM.from_pretrained(
                 self.config.neuron.global_model_name,
                 revision=f"{__run__}.{self.global_progress.epoch}.0",
@@ -429,13 +487,6 @@ class Miner(BaseMinerNeuron):
                 "Your local miner_hf_repo_id set to the global model_name. This will harm your incentive. Set miner_hf_repo_id to a unique huggingface repo id."
             )
 
-        # Move current model to CPU only for comparison if not already there
-        # This is to free up GPU memory temporarily if global model was loaded to GPU
-        # and current model is also on GPU.
-        if self.model.device != torch.device("cpu"):
-            self.model.to("cpu")
-            torch.cuda.empty_cache() # Clear GPU cache after moving model
-
         should_sync_model = (
             (self.local_progress.epoch is None)
             or (self.local_progress.epoch != self.global_progress.epoch)
@@ -447,10 +498,11 @@ class Miner(BaseMinerNeuron):
         
         # Move local model back to the device immediately after comparison
         self.model.to(self.device)
+        bt.logging.info("Moved local model back to GPU after global model comparison.")
         
         del global_model # Delete global model as soon as it's not needed
-        gc.collect()
-        torch.cuda.empty_cache()
+        gc.collect() # Manually trigger garbage collection for Python objects
+        torch.cuda.empty_cache() # Explicitly clear PyTorch's CUDA memory cache
 
         if should_sync_model:
             load_state_from_peer(self, epoch=self.global_progress.epoch)
@@ -514,6 +566,11 @@ class Miner(BaseMinerNeuron):
                     "scheduler_state": self.scheduler.state_dict(),
                     "epoch": epoch,
                 }
+                # Consider saving optimizer state to CPU if offload_optimizer is true,
+                # as the optimizer itself might consume significant memory during saving.
+                # The current implementation saves it directly from self.inner_optimizer,
+                # which might still reside on the GPU if not explicitly moved by an
+                # optimizer offloading strategy.
                 torch.save(
                     optimizer_state,
                     os.path.join(
@@ -681,6 +738,11 @@ class Miner(BaseMinerNeuron):
                     sequence_length=1024,
                     pages_info=pages,
                     tokenizer=self.tokenizer,
+                    # Added num_workers for parallel data loading.
+                    # Use a value appropriate for your 9 CPUs,
+                    # e.g., (number_of_cpus - 1) to leave one core for other tasks.
+                    num_workers=os.cpu_count() - 1 if os.cpu_count() > 1 else 0, # Use 8 workers for 9 CPUs
+                    pin_memory=True # Pin memory for faster GPU transfers
                 )
 
                 return dataset
@@ -746,6 +808,7 @@ class Miner(BaseMinerNeuron):
 
             # Move to device - Data already on device if using DatasetLoader with device argument
             # Ensure tensors are contiguous if performing operations that benefit from it
+            # Using non_blocking=True for asynchronous memory transfer
             inputs, labels = inputs.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -793,7 +856,8 @@ class Miner(BaseMinerNeuron):
 
         self.scheduler.step()
 
-        self.inner_optimizer.zero_grad(set_to_none=True) # More efficient than zero_grad()
+        # Set gradients to None for memory efficiency instead of zeroing
+        self.inner_optimizer.zero_grad(set_to_none=True)
 
         self.local_progress.inner_step += 1
 
