@@ -45,7 +45,7 @@ from huggingface_hub import (
 )
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 import distributed_training
 from distributed_training import __run__
@@ -100,7 +100,7 @@ class Miner(BaseMinerNeuron):
 
         # Core setup
         self.device = self.config.neuron.device
-        self.uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address) # CORRECTED: ss558_address to ss58_address
+        self.uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
         init_dht(self)
 
         # Progress tracking
@@ -227,12 +227,12 @@ class Miner(BaseMinerNeuron):
     def _get_gpu_utilization(self):
         """Get GPU utilization percentage"""
         try:
-            if self.device.type == "cuda": # FIXED: Use .type == "cuda"
+            if self.device.type == "cuda":
                 # Use pynvml if available for lower overhead, fallback to subprocess
                 try:
                     import pynvml
                     pynvml.nvmlInit()
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device()) # Use current_device
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
                     utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
                     return float(utilization.gpu)
                 except ImportError:
@@ -257,7 +257,7 @@ class Miner(BaseMinerNeuron):
     def _get_gpu_memory_used_gb(self):
         """Get GPU memory used in GB"""
         try:
-            if self.device.type == "cuda": # FIXED: Use .type == "cuda"
+            if self.device.type == "cuda":
                 # Use pynvml if available
                 try:
                     import pynvml
@@ -439,7 +439,7 @@ class Miner(BaseMinerNeuron):
         # With 48GB VRAM, you can significantly increase local_batch_size_train.
         # Start with a higher value than before, e.g., 8, 16, or even 32,
         # and adjust based on actual memory usage.
-        self.local_batch_size_train = self.config.neuron.local_batch_size_train # This should be set in config/CLI
+        self.local_batch_size_train = self.config.neuron.local_batch_size_train
         self.local_batch_size_train_effective = (
             self.config.neuron.local_batch_size_train_effective
         )
@@ -459,28 +459,55 @@ class Miner(BaseMinerNeuron):
         log_peerid_to_chain(self)
 
     def _sync_with_global_model(self):
-        # Load global model directly to the device if possible and sufficient VRAM
+        """Synchronizes the local model with the global model from Hugging Face."""
+        global_model = None
         try:
             # Temporarily move self.model to CPU to free up VRAM for global_model comparison
-            # This is crucial if both models are very large.
             if self.model.device != torch.device("cpu"):
                 self.model.to("cpu")
                 bt.logging.info("Moved local model to CPU for global model comparison to free VRAM.")
                 torch.cuda.empty_cache() # Clear GPU cache after moving model
 
-            global_model = AutoModelForCausalLM.from_pretrained(
-                self.config.neuron.global_model_name,
-                revision=f"{__run__}.{self.global_progress.epoch}.0",
-                trust_remote_code=False,
-            ).to(self.device)
-            bt.logging.info("Global model loaded directly to device for schema comparison.")
-        except RuntimeError as e:
-            bt.logging.warning(f"Could not load global model directly to device: {e}. Loading to CPU.")
-            global_model = AutoModelForCausalLM.from_pretrained(
-                self.config.neuron.global_model_name,
-                revision=f"{__run__}.{self.global_progress.epoch}.0",
-                trust_remote_code=False,
+            # Define quantization configuration for 8-bit loading
+            # This requires `bitsandbytes` and `accelerate` libraries to be installed.
+            bnb_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                bnb_8bit_compute_dtype=torch.bfloat16, # or torch.float16
+                bnb_8bit_quant_type="nf4", # or "fp4"
+                bnb_8bit_use_double_quant=True,
             )
+
+            bt.logging.info("Attempting to load global model with 8-bit quantization and device_map='auto'.")
+            global_model = AutoModelForCausalLM.from_pretrained(
+                self.config.neuron.global_model_name,
+                revision=f"{__run__}.{self.global_progress.epoch}.0",
+                trust_remote_code=False,
+                quantization_config=bnb_config, # Apply quantization config
+                device_map="auto", # Automatically map model layers to available devices
+            )
+            bt.logging.info("Global model loaded successfully with quantization and device_map='auto'.")
+
+        except Exception as e:
+            bt.logging.warning(f"Could not load global model with quantization/device_map: {e}. Falling back to CPU load without quantization.")
+            if global_model: # Clean up if partial load happened
+                del global_model
+                global_model = None
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            try:
+                # Fallback: Load to CPU without quantization
+                global_model = AutoModelForCausalLM.from_pretrained(
+                    self.config.neuron.global_model_name,
+                    revision=f"{__run__}.{self.global_progress.epoch}.0",
+                    trust_remote_code=False,
+                )
+                bt.logging.info("Global model loaded to CPU as fallback.")
+            except Exception as e_fallback:
+                bt.logging.error(f"Failed to load global model even to CPU: {e_fallback}. This is a critical error.")
+                # Re-raise or handle appropriately, as synchronization will fail
+                self.model.to(self.device) # Move local model back even if global failed
+                raise e_fallback # Re-raise to stop the miner if the global model cannot be loaded at all
 
         if self.config.neuron.global_model_name == self.config.neuron.local_model_name:
             bt.logging.warning(
@@ -500,7 +527,8 @@ class Miner(BaseMinerNeuron):
         self.model.to(self.device)
         bt.logging.info("Moved local model back to GPU after global model comparison.")
         
-        del global_model # Delete global model as soon as it's not needed
+        if global_model: # Ensure global_model exists before deleting
+            del global_model # Delete global model as soon as it's not needed
         gc.collect() # Manually trigger garbage collection for Python objects
         torch.cuda.empty_cache() # Explicitly clear PyTorch's CUDA memory cache
 
@@ -727,7 +755,7 @@ class Miner(BaseMinerNeuron):
             try:
                 pages = await DatasetLoader.next_pages(
                     offset=self.current_block,
-                    n_pages=15, # MODIFIED: Reduced from 35 to 15 to lower RAM consumption per fetch
+                    n_pages=15,
                     seed=self.uid,
                 )
                 random.seed(self.uid)
@@ -738,7 +766,6 @@ class Miner(BaseMinerNeuron):
                     sequence_length=1024,
                     pages_info=pages,
                     tokenizer=self.tokenizer,
-                    # REMOVED: pin_memory=False
                 )
                 # Explicitly clear memory after creating dataset
                 gc.collect()
@@ -770,8 +797,6 @@ class Miner(BaseMinerNeuron):
                 self.training_active.wait()
 
                 # Periodic model upload
-                # Check for block list length *after* a potential pause and resume,
-                # so training can continue for a bit before triggering another upload.
                 if (
                     len(self.model.config.block_list)
                     >= self.config.neuron.target_n_blocks
@@ -883,11 +908,6 @@ class Miner(BaseMinerNeuron):
                         "Cancelling Ongoing Model Upload For AllReduce Operation"
                     )
                     self.current_upload_future.cancel()
-                    # Await the cancellation if it's critical to ensure it's stopped before proceeding
-                    # try:
-                    #     await self.current_upload_future # This might raise CancelledError
-                    # except asyncio.CancelledError:
-                    #     bt.logging.info("Background upload successfully cancelled.")
 
                 # Ensure training is paused
                 self.pause_training()
@@ -922,7 +942,6 @@ class Miner(BaseMinerNeuron):
                         self.local_progress,
                         self.all_reduce_start_time,
                         self.current_block,
-                        # bandwidth
                     )
                     if not synapse.completion:
                         raise Exception("AllReduce Failed, Loading Latest State")
@@ -951,7 +970,7 @@ class Miner(BaseMinerNeuron):
             else:
                 self.all_reduce_success_status = False
                 # If all_reduce failed, ensure training resumes unless specific error handling is needed
-                self.resume_training() # It's generally good to resume training even if all_reduce fails, to not stall the miner
+                self.resume_training()
 
             return synapse
 
