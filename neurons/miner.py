@@ -227,7 +227,7 @@ class Miner(BaseMinerNeuron):
     def _get_gpu_utilization(self):
         """Get GPU utilization percentage"""
         try:
-            if self.device.startswith("cuda"):
+            if self.device.type == "cuda": # FIXED: Use .type == "cuda"
                 # Use pynvml if available for lower overhead, fallback to subprocess
                 try:
                     import pynvml
@@ -257,7 +257,7 @@ class Miner(BaseMinerNeuron):
     def _get_gpu_memory_used_gb(self):
         """Get GPU memory used in GB"""
         try:
-            if self.device.startswith("cuda"):
+            if self.device.type == "cuda": # FIXED: Use .type == "cuda"
                 # Use pynvml if available
                 try:
                     import pynvml
@@ -738,10 +738,7 @@ class Miner(BaseMinerNeuron):
                     sequence_length=1024,
                     pages_info=pages,
                     tokenizer=self.tokenizer,
-                    # Added num_workers for parallel data loading.
-                    # Use a value appropriate for your 9 CPUs,
-                    # e.g., (number_of_cpus - 1) to leave one core for other tasks.
-                    num_workers=os.cpu_count() - 1 if os.cpu_count() > 1 else 0, # Use 8 workers for 9 CPUs
+                    # Removed num_workers as it's not supported by DatasetLoader.create()
                     pin_memory=True # Pin memory for faster GPU transfers
                 )
 
